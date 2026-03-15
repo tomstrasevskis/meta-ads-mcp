@@ -2,7 +2,7 @@
 
 import json
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 import io
 from PIL import Image as PILImage
 from mcp.server.fastmcp import Image
@@ -242,20 +242,36 @@ async def get_creative_details(creative_id: str, access_token: Optional[str] = N
     # "(#100) Tried accessing nonexisting field" on simple creatives in API v24.
     # We fetch the safe fields first, then try dynamic_creative_spec separately.
     params = {
-        "fields": "id,name,status,thumbnail_url,image_url,image_hash,object_story_spec,object_type,body,title,effective_object_story_id,asset_feed_spec{images,videos,bodies,titles,descriptions,link_urls,ad_formats,call_to_action_types,optimization_type},url_tags,link_url"
+        "fields": "id,name,status,thumbnail_url,image_url,image_hash,object_story_spec,object_type,body,title,effective_object_story_id,asset_feed_spec{images,videos,bodies,titles,descriptions,link_urls,ad_formats,call_to_action_types,optimization_type,asset_customization_rules},url_tags,link_url"
     }
     data = await make_api_request(endpoint, access_token, params)
 
-    # Try to fetch dynamic_creative_spec separately (only exists on dynamic creatives)
+    # Try to fetch optional fields separately (may not exist on all creative types)
     if isinstance(data, dict) and "id" in data:
-        try:
-            dcs_data = await make_api_request(
-                endpoint, access_token, {"fields": "dynamic_creative_spec"}
-            )
-            if isinstance(dcs_data, dict) and "dynamic_creative_spec" in dcs_data:
-                data["dynamic_creative_spec"] = dcs_data["dynamic_creative_spec"]
-        except Exception:
-            pass  # Field doesn't exist on this creative type
+        for opt_field in ["dynamic_creative_spec", "product_set_id"]:
+            try:
+                opt_data = await make_api_request(
+                    endpoint, access_token, {"fields": opt_field}
+                )
+                if isinstance(opt_data, dict) and opt_field in opt_data:
+                    data[opt_field] = opt_data[opt_field]
+            except Exception:
+                pass  # Field doesn't exist on this creative type
+
+        # Resolve product_set_id -> catalog info for DPA/catalog creatives
+        if "product_set_id" in data:
+            try:
+                catalog_data = await make_api_request(
+                    data["product_set_id"], access_token,
+                    {"fields": "product_catalog{id,name}"}
+                )
+                catalog = catalog_data.get("product_catalog", {})
+                if catalog.get("id"):
+                    data["catalog_id"] = catalog["id"]
+                    if catalog.get("name"):
+                        data["catalog_name"] = catalog["name"]
+            except Exception:
+                pass  # Non-critical
 
     return json.dumps(data, indent=2)
 
@@ -347,7 +363,7 @@ async def get_ad_creatives(ad_id: str, access_token: Optional[str] = None) -> st
         
     endpoint = f"{ad_id}/adcreatives"
     params = {
-        "fields": "id,name,status,thumbnail_url,image_url,image_hash,object_story_spec,object_type,body,title,effective_object_story_id,asset_feed_spec,url_tags,image_urls_for_viewing"
+        "fields": "id,name,status,thumbnail_url,image_url,image_hash,object_story_spec,object_type,body,title,effective_object_story_id,asset_feed_spec,url_tags,image_urls_for_viewing,product_set_id"
     }
     
     data = await make_api_request(endpoint, access_token, params)
@@ -388,6 +404,23 @@ async def get_ad_creatives(ad_id: str, access_token: Optional[str] = None) -> st
         # Add image URLs for direct viewing if available
         for creative in data['data']:
             creative['image_urls_for_viewing'] = extract_creative_image_urls(creative)
+
+        # Resolve product_set_id -> catalog info for DPA/catalog creatives
+        for creative in data['data']:
+            ps_id = creative.get('product_set_id')
+            if ps_id:
+                try:
+                    catalog_data = await make_api_request(
+                        ps_id, access_token,
+                        {"fields": "product_catalog{id,name}"}
+                    )
+                    catalog = catalog_data.get("product_catalog", {})
+                    if catalog.get("id"):
+                        creative["catalog_id"] = catalog["id"]
+                        if catalog.get("name"):
+                            creative["catalog_name"] = catalog["name"]
+                except Exception:
+                    pass  # Non-critical
 
     return json.dumps(data, indent=2)
 
@@ -594,6 +627,82 @@ async def get_ad_image(ad_id: str, access_token: Optional[str] = None) -> Image:
         return f"Error processing image: {str(e)}"
 
 
+@mcp_server.tool()
+@meta_api_tool
+async def get_ad_video(ad_id: str = "", video_id: str = "", access_token: Optional[str] = None) -> str:
+    """
+    Get video details and source URL for a Meta ad video creative. Returns the video source URL
+    (direct download link), thumbnail URL, and metadata (title, description, duration).
+
+    Provide either ad_id (to auto-extract the video from the ad creative) or video_id directly.
+
+    Args:
+        ad_id: Meta Ads ad ID (will extract video_id from the ad creative)
+        video_id: Meta video ID (use this if you already have it from get_ad_creatives)
+        access_token: Meta API access token (optional - will use cached token if not provided)
+    """
+    if not ad_id and not video_id:
+        return json.dumps({"error": "Provide either ad_id or video_id"}, indent=2)
+
+    # If only ad_id provided, extract video_id from the creative
+    if not video_id:
+        creative_json = await get_ad_creatives(access_token=access_token, ad_id=ad_id)
+        creative_data = json.loads(creative_json)
+
+        if "error" in creative_data:
+            return json.dumps({"error": f"Could not get creatives for ad {ad_id}", "details": creative_data}, indent=2)
+
+        # Extract video_id from creative data
+        if "data" in creative_data and creative_data["data"]:
+            creative = creative_data["data"][0]
+
+            # Check object_story_spec.video_data.video_id
+            oss = creative.get("object_story_spec", {})
+            if "video_data" in oss:
+                video_id = str(oss["video_data"].get("video_id", ""))
+
+            # Check asset_feed_spec.videos
+            if not video_id:
+                afs = creative.get("asset_feed_spec", {})
+                videos = afs.get("videos", [])
+                if videos:
+                    video_id = str(videos[0].get("video_id", ""))
+
+        if not video_id:
+            return json.dumps({
+                "error": "No video found in this ad creative",
+                "hint": "This ad may be an image ad. Use get_ad_image instead."
+            }, indent=2)
+
+    # Fetch video details including source URL
+    video_data = await make_api_request(
+        video_id,
+        access_token,
+        {"fields": "source,title,description,length,picture,thumbnails,created_time"}
+    )
+
+    if "error" in video_data:
+        return json.dumps({"error": f"Could not get video {video_id}", "details": video_data}, indent=2)
+
+    result = {
+        "video_id": video_id,
+        "source_url": video_data.get("source"),
+        "thumbnail_url": video_data.get("picture"),
+        "title": video_data.get("title"),
+        "description": video_data.get("description"),
+        "duration_seconds": video_data.get("length"),
+        "created_time": video_data.get("created_time"),
+    }
+
+    if ad_id:
+        result["ad_id"] = ad_id
+
+    if not result["source_url"]:
+        result["warning"] = "No source URL returned. The video may have been deleted or you may lack permissions."
+
+    return json.dumps(result, indent=2)
+
+
 if ENABLE_SAVE_AD_IMAGE_LOCALLY:
     @mcp_server.tool()
     @meta_api_tool
@@ -728,12 +837,12 @@ async def update_ad(
     status: Optional[str] = None,
     bid_amount: Optional[int] = None,
     tracking_specs: Optional[List[Dict[str, Any]]] = None,
-    creative_id: Optional[str] = None,
+    creative_id: Optional[Union[str, int]] = None,
     access_token: Optional[str] = None
 ) -> str:
     """
     Update an ad with new settings.
-    
+
     Args:
         ad_id: Meta Ads ad ID
         status: Update ad status (ACTIVE, PAUSED, etc.)
@@ -744,6 +853,10 @@ async def update_ad(
     """
     if not ad_id:
         return json.dumps({"error": "Ad ID is required"}, indent=2)
+
+    # Coerce numeric IDs to strings (LLM clients may send integers for numeric-only IDs)
+    if creative_id is not None:
+        creative_id = str(creative_id)
 
     params = {}
     if status:
@@ -992,7 +1105,7 @@ async def create_ad_creative(
     image_hash: Optional[str] = None,
     access_token: Optional[str] = None,
     name: Optional[str] = None,
-    page_id: Optional[str] = None,
+    page_id: Optional[Union[str, int]] = None,
     link_url: Optional[str] = None,
     message: Optional[str] = None,
     messages: Optional[List[str]] = None,
@@ -1001,16 +1114,18 @@ async def create_ad_creative(
     description: Optional[str] = None,
     descriptions: Optional[List[str]] = None,
     image_hashes: Optional[List[str]] = None,
-    video_id: Optional[str] = None,
+    video_id: Optional[Union[str, int]] = None,
     thumbnail_url: Optional[str] = None,
     optimization_type: Optional[str] = None,
     dynamic_creative_spec: Optional[Dict[str, Any]] = None,
     call_to_action_type: Optional[str] = None,
-    lead_gen_form_id: Optional[str] = None,
+    lead_gen_form_id: Optional[Union[str, int]] = None,
     instagram_actor_id: Optional[str] = None,
     ad_formats: Optional[List[str]] = None,
     asset_customization_rules: Optional[List[Dict[str, Any]]] = None,
-    creative_features_spec: Optional[Dict[str, Any]] = None
+    creative_features_spec: Optional[Dict[str, Any]] = None,
+    phone_number: Optional[str] = None,
+    url_tags: Optional[str] = None
 ) -> str:
     """
     Create a new ad creative using an uploaded image hash or video ID.
@@ -1043,19 +1158,29 @@ async def create_ad_creative(
                           Meta to auto-optimize across all asset combinations. When using
                           DEGREES_OF_FREEDOM, at least one asset field (image_hashes, messages,
                           headlines, or descriptions) must contain more than one variant.
+                          NOTE: Meta silently ignores asset_customization_rules for DOF creatives.
+                          If you need per-placement images, use regular dynamic creative mode
+                          (without optimization_type) with is_dynamic_creative on the ad set.
         dynamic_creative_spec: Dynamic creative optimization settings
-        call_to_action_type: Call to action button type (e.g., 'LEARN_MORE', 'SIGN_UP', 'SHOP_NOW')
+        call_to_action_type: Call to action button type (e.g., 'LEARN_MORE', 'SIGN_UP', 'SHOP_NOW',
+                            'CALL_NOW'). When using CALL_NOW, also provide phone_number.
         lead_gen_form_id: Lead generation form ID for lead generation campaigns. Required when using
                          lead generation CTAs like 'SIGN_UP', 'GET_OFFER', 'SUBSCRIBE', etc.
-        instagram_actor_id: Optional Instagram account ID for Instagram placements.
-                           Sent as instagram_user_id inside object_story_spec (Meta deprecated
-                           instagram_actor_id in Jan 2026).
+        instagram_actor_id: Instagram account ID for Instagram placements (must be a string
+                           to avoid JavaScript integer precision loss for IDs exceeding
+                           Number.MAX_SAFE_INTEGER). Sent as instagram_user_id inside
+                           object_story_spec (Meta deprecated instagram_actor_id in Jan 2026).
         ad_formats: List of ad format strings for asset_feed_spec (e.g., ["AUTOMATIC_FORMAT"] for
                    Flexible ads, ["SINGLE_IMAGE"] for single image, ["SINGLE_VIDEO"] for video).
                    When optimization_type is "DEGREES_OF_FREEDOM" with image_hashes, defaults to
                    ["AUTOMATIC_FORMAT"] (Flexible format). For video creatives, defaults to
                    ["SINGLE_VIDEO"]. Otherwise defaults to ["SINGLE_IMAGE"].
         asset_customization_rules: List of placement-specific asset overrides for asset_feed_spec.
+        phone_number: Phone number for CALL_NOW call-to-action ads (click-to-call).
+                     Required when call_to_action_type is CALL_NOW. Use E.164 format
+                     (e.g., "+18005551234"). The number is passed to Meta in
+                     call_to_action.value.phone_number. Common use case: geo-routed
+                     call ads with different phone numbers per ad set.
         creative_features_spec: Advantage+ Creative feature opt-ins/opt-outs. Controls individual
                    creative enhancements like image_touchups, text_optimizations, inline_comment,
                    add_text_overlay, music, 3d_animation, etc. Each feature is a dict with
@@ -1063,7 +1188,10 @@ async def create_ad_creative(
                    Example: {"image_touchups": {"enroll_status": "OPT_IN"},
                             "inline_comment": {"enroll_status": "OPT_IN"}}
                    Sent to Meta as degrees_of_freedom_spec.creative_features_spec.
-                   Lets you assign different images or videos to specific placement groups
+        url_tags: URL tracking parameters appended to the destination URL (e.g.,
+                 "utm_source=facebook&utm_medium=cpc&utm_campaign=spring_sale").
+                 Sets the url_tags field on the creative.
+        asset_customization_rules: Lets you assign different images or videos to specific placement groups
                    (e.g., feed vs. stories). Only valid with image_hashes or plural asset params.
                    Each rule uses a user-friendly format that is automatically translated to
                    Meta's API format (adlabels + customization_spec positions):
@@ -1088,6 +1216,14 @@ async def create_ad_creative(
     # Check required parameters
     if not account_id:
         return json.dumps({"error": "No account ID provided"}, indent=2)
+
+    # Coerce numeric IDs to strings (LLM clients may send integers for numeric-only IDs)
+    if video_id is not None:
+        video_id = str(video_id)
+    if instagram_actor_id is not None:
+        instagram_actor_id = str(instagram_actor_id).strip('"').strip("'")
+    if lead_gen_form_id is not None:
+        lead_gen_form_id = str(lead_gen_form_id)
 
     # Defensive coercion: some MCP transports deliver array/dict params as JSON strings
     if isinstance(asset_customization_rules, str):
@@ -1363,6 +1499,8 @@ async def create_ad_creative(
                     cta_value["link"] = link_url
                 if lead_gen_form_id:
                     cta_value["lead_gen_form_id"] = lead_gen_form_id
+                if phone_number:
+                    cta_value["phone_number"] = phone_number
                 cta_data = {"type": cta_type}
                 if cta_value:
                     cta_data["value"] = cta_value
@@ -1384,6 +1522,8 @@ async def create_ad_creative(
                         cta_value["link"] = link_url
                     if lead_gen_form_id:
                         cta_value["lead_gen_form_id"] = lead_gen_form_id
+                    if phone_number:
+                        cta_value["phone_number"] = phone_number
                     if cta_value:
                         cta["value"] = cta_value
                     link_data["call_to_action"] = cta
@@ -1422,6 +1562,8 @@ async def create_ad_creative(
                     cta_value["link"] = link_url
                 if lead_gen_form_id:
                     cta_value["lead_gen_form_id"] = lead_gen_form_id
+                if phone_number:
+                    cta_value["phone_number"] = phone_number
                 cta_type = call_to_action_type or ("LEARN_MORE" if link_url else None)
                 if cta_type:
                     cta_data = {"type": cta_type}
@@ -1458,10 +1600,15 @@ async def create_ad_creative(
                 # Add call_to_action to link_data for simple creatives
                 if call_to_action_type:
                     cta_data = {"type": call_to_action_type}
+                    cta_value = {}
 
                     # Add lead form ID to value object if provided (required for lead generation campaigns)
                     if lead_gen_form_id:
-                        cta_data["value"] = {"lead_gen_form_id": lead_gen_form_id}
+                        cta_value["lead_gen_form_id"] = lead_gen_form_id
+                    if phone_number:
+                        cta_value["phone_number"] = phone_number
+                    if cta_value:
+                        cta_data["value"] = cta_value
 
                     creative_data["object_story_spec"]["link_data"]["call_to_action"] = cta_data
 
@@ -1475,6 +1622,10 @@ async def create_ad_creative(
             creative_data["degrees_of_freedom_spec"] = {
                 "creative_features_spec": creative_features_spec
             }
+
+        # Add URL tracking parameters if provided.
+        if url_tags:
+            creative_data["url_tags"] = url_tags
 
         # instagram_actor_id → instagram_user_id migration (Jan 2026).
         # Meta deprecated instagram_actor_id; the replacement is instagram_user_id
@@ -1516,7 +1667,7 @@ async def create_ad_creative(
             creative_id = data["id"]
             creative_endpoint = f"{creative_id}"
             creative_params = {
-                "fields": "id,name,status,thumbnail_url,image_url,image_hash,object_story_spec,object_type,body,title,effective_object_story_id,asset_feed_spec{images,videos,bodies,titles,descriptions,link_urls,ad_formats,call_to_action_types,optimization_type},url_tags,link_url"
+                "fields": "id,name,status,thumbnail_url,image_url,image_hash,object_story_spec,object_type,body,title,effective_object_story_id,asset_feed_spec{images,videos,bodies,titles,descriptions,link_urls,ad_formats,call_to_action_types,optimization_type,asset_customization_rules},url_tags,link_url"
             }
 
             creative_details = await make_api_request(creative_endpoint, access_token, creative_params)
@@ -1551,7 +1702,7 @@ async def update_ad_creative(
     optimization_type: Optional[str] = None,
     dynamic_creative_spec: Optional[Dict[str, Any]] = None,
     call_to_action_type: Optional[str] = None,
-    lead_gen_form_id: Optional[str] = None,
+    lead_gen_form_id: Optional[Union[str, int]] = None,
     ad_formats: Optional[List[str]] = None
 ) -> str:
     """
@@ -1583,6 +1734,9 @@ async def update_ad_creative(
     Returns:
         JSON response with updated creative details
     """
+    # Coerce numeric IDs to strings (LLM clients may send integers for numeric-only IDs)
+    if lead_gen_form_id is not None:
+        lead_gen_form_id = str(lead_gen_form_id)
     # Check required parameters
     if not creative_id:
         return json.dumps({"error": "No creative ID provided"}, indent=2)
