@@ -2,7 +2,7 @@
 
 import json
 from typing import Optional, Dict, Any, List
-from .api import meta_api_tool, make_api_request
+from .api import meta_api_tool, make_api_request, ensure_act_prefix
 from .accounts import get_ad_accounts
 from .server import mcp_server
 
@@ -22,7 +22,9 @@ async def get_adsets(account_id: str, access_token: Optional[str] = None, limit:
     # Require explicit account_id
     if not account_id:
         return json.dumps({"error": "No account ID specified"}, indent=2)
-    
+
+    account_id = ensure_act_prefix(account_id)
+
     # Change endpoint based on whether campaign_id is provided
     if campaign_id:
         endpoint = f"{campaign_id}/adsets"
@@ -103,6 +105,8 @@ async def create_adset(
     promoted_object: Optional[Dict[str, Any]] = None,
     destination_type: Optional[str] = None,
     is_dynamic_creative: Optional[bool] = None,
+    frequency_control_specs: Optional[List[Dict[str, Any]]] = None,
+    multi_advertiser_ads: Optional[int] = None,
     access_token: Optional[str] = None
 ) -> str:
     """
@@ -149,12 +153,20 @@ async def create_adset(
                          'INSTAGRAM_DIRECT', 'ON_AD', 'APP', 'FACEBOOK', 'SHOP_AUTOMATIC'.
                          Also supports multi-channel combos like 'MESSAGING_MESSENGER_WHATSAPP'.
         is_dynamic_creative: Enable Dynamic Creative for this ad set.
+        frequency_control_specs: Frequency cap specs. MUST be set at creation time — Meta makes this field
+                                 immutable after the ad set is created (error 1815198).
+                                 Only works with OUTCOME_AWARENESS campaigns + optimization_goal REACH or THRUPLAY.
+                                 Example: [{"event": "IMPRESSIONS", "interval_days": 7, "max_frequency": 1}]
+        multi_advertiser_ads: Set to 0 to opt out of Multi-Advertiser Ads, 1 to opt in.
+                             This is a TOP-LEVEL ad set parameter — do NOT put it inside the targeting object.
         access_token: Meta API access token (optional - will use cached token if not provided)
     """
     # Check required parameters
     if not account_id:
         return json.dumps({"error": "No account ID provided"}, indent=2)
-    
+
+    account_id = ensure_act_prefix(account_id)
+
     if not campaign_id:
         return json.dumps({"error": "No campaign ID provided"}, indent=2)
     
@@ -345,7 +357,13 @@ async def create_adset(
     # Enable Dynamic Creative if requested
     if is_dynamic_creative is not None:
         params["is_dynamic_creative"] = "true" if bool(is_dynamic_creative) else "false"
-    
+
+    if frequency_control_specs is not None:
+        params["frequency_control_specs"] = json.dumps(frequency_control_specs)
+
+    if multi_advertiser_ads is not None:
+        params["multi_advertiser_ads"] = str(multi_advertiser_ads)
+
     try:
         data = await make_api_request(endpoint, access_token, params, method="POST")
         return json.dumps(data, indent=2)
@@ -394,6 +412,7 @@ async def update_adset(adset_id: str, frequency_control_specs: Optional[List[Dic
                         end_time: Optional[str] = None,
                         dsa_beneficiary: Optional[str] = None,
                         dsa_payor: Optional[str] = None,
+                        multi_advertiser_ads: Optional[int] = None,
                         access_token: Optional[str] = None) -> str:
     """
     Update an ad set with new settings including frequency caps and budgets.
@@ -420,6 +439,8 @@ async def update_adset(adset_id: str, frequency_control_specs: Optional[List[Dic
         daily_budget: Daily budget in account currency (in cents)
         lifetime_budget: Lifetime budget in account currency (in cents)
         is_dynamic_creative: Enable/disable Dynamic Creative for this ad set.
+                            WARNING: This field is immutable after ad set creation. Meta's API will
+                            return success but silently ignore the change. To change this, create a new ad set.
         start_time: Start time in ISO 8601 format (e.g., '2023-12-01T12:00:00-0800').
                    Use with status=ACTIVE to schedule the ad set for future delivery (effective_status will be SCHEDULED until start_time).
         end_time: End time in ISO 8601 format. Required when lifetime_budget is specified.
@@ -427,6 +448,8 @@ async def update_adset(adset_id: str, frequency_control_specs: Optional[List[Dic
                         Required for EU-targeted ad sets along with dsa_payor.
         dsa_payor: DSA payor for European compliance (person/org paying for the ads).
                    Required for EU-targeted ad sets along with dsa_beneficiary.
+        multi_advertiser_ads: Set to 0 to opt out of Multi-Advertiser Ads, 1 to opt in.
+                             This is a TOP-LEVEL ad set parameter — do NOT put it inside the targeting object.
         access_token: Meta API access token (optional - will use cached token if not provided)
     """
     if not adset_id:
@@ -524,6 +547,9 @@ async def update_adset(adset_id: str, frequency_control_specs: Optional[List[Dic
 
     if dsa_payor is not None:
         params['dsa_payor'] = dsa_payor
+
+    if multi_advertiser_ads is not None:
+        params['multi_advertiser_ads'] = str(multi_advertiser_ads)
 
     if not params:
         return json.dumps({"error": "No update parameters provided"}, indent=2)

@@ -23,6 +23,13 @@ class McpToolError(Exception):
     pass
 
 
+def ensure_act_prefix(account_id: str) -> str:
+    """Ensure account_id has the 'act_' prefix required by Meta's Graph API."""
+    if account_id and not account_id.startswith("act_"):
+        return f"act_{account_id}"
+    return account_id
+
+
 # Constants
 META_GRAPH_API_VERSION = "v24.0"
 META_GRAPH_API_BASE = f"https://graph.facebook.com/{META_GRAPH_API_VERSION}"
@@ -173,6 +180,19 @@ async def make_api_request(
                 
                 logger.debug(f"POST params (prepared): {masked_params}")
                 response = await client.post(url, data=request_params, headers=headers, timeout=30.0)
+            elif method == "PUT":
+                # PUT for updates that Meta requires via PUT (e.g., creative_features_spec).
+                # Meta expects access_token as a query param, not in the body.
+                query_params = {}
+                body_params = {}
+                for key, value in request_params.items():
+                    if key in ("access_token", "appsecret_proof"):
+                        query_params[key] = value
+                    elif isinstance(value, (list, dict)):
+                        body_params[key] = json.dumps(value)
+                    else:
+                        body_params[key] = value
+                response = await client.put(url, params=query_params, data=body_params, headers=headers, timeout=30.0)
             elif method == "DELETE":
                 response = await client.delete(url, params=request_params, headers=headers, timeout=30.0)
             else:
